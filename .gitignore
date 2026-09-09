@@ -1,0 +1,10 @@
+# 运行时生成的个人文件（含真实 IP / 个人设置，不入库）
+config.json
+geo_cache.json
+ip_guard.log
+
+# 临时 / 截图 / 编辑器
+*.png
+*.user
+.vs/
+scratchpad/
