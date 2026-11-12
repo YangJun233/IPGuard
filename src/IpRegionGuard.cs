@@ -10,6 +10,8 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -221,6 +223,23 @@ namespace IpRegionGuard
             if (s == null) return "";
             return s.Length <= max ? s : s.Substring(0, max - 1) + "…";
         }
+
+        // 任务管理器那样的友好名：优先 exe 的 FileDescription，取不到就用 fallback（进程名）。
+        public static string FriendlyName(string path, string fallback)
+        {
+            try
+            {
+                if (!string.IsNullOrEmpty(path) && File.Exists(path))
+                {
+                    FileVersionInfo fvi = FileVersionInfo.GetVersionInfo(path);
+                    if (fvi != null && !string.IsNullOrEmpty(fvi.FileDescription))
+                        return fvi.FileDescription.Trim();
+                }
+            }
+            catch { }
+            if (!string.IsNullOrEmpty(fallback)) return fallback;
+            try { return Path.GetFileNameWithoutExtension(path); } catch { return path; }
+        }
     }
 
     static class NativeMethods
@@ -287,6 +306,179 @@ namespace IpRegionGuard
             if (ms <= 250) return 100;
             int q = (int)(100 - (ms - 250) * 100.0 / 2750.0);   // 250ms→100, 3000ms→0
             return q;
+        }
+    }
+
+    // ================================================================ 进程关闭（整棵进程树）
+
+    // 关闭指定程序：把它拉起的插件/子进程一并清掉。
+    // - 同名多实例全部纳入（如浏览器一个 app 开一堆同名进程）；
+    // - 用 Toolhelp32 的父子关系收集所有后代进程；
+    // - 非强制时先对有窗口的发正常关闭(WM_CLOSE)，等 2 秒，再对残留从子到父强制结束。
+    // 结束同一用户的进程不需要管理员权限（目标以管理员运行时才需要）。
+    static class ProcKiller
+    {
+        const uint TH32CS_SNAPPROCESS = 0x00000002;
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        struct PROCESSENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern bool Process32First(IntPtr snap, ref PROCESSENTRY32 pe);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        static extern bool Process32Next(IntPtr snap, ref PROCESSENTRY32 pe);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr h);
+
+        struct Snap { public Dictionary<int, int> parent; public Dictionary<int, string> name; }
+
+        static Snap Enumerate()
+        {
+            Snap s = new Snap();
+            s.parent = new Dictionary<int, int>();
+            s.name = new Dictionary<int, string>();
+            IntPtr h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (h == IntPtr.Zero || h == new IntPtr(-1)) return s;
+            try
+            {
+                PROCESSENTRY32 pe = new PROCESSENTRY32();
+                pe.dwSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(PROCESSENTRY32));
+                if (Process32First(h, ref pe))
+                {
+                    do
+                    {
+                        int pid = (int)pe.th32ProcessID;
+                        s.parent[pid] = (int)pe.th32ParentProcessID;
+                        s.name[pid] = pe.szExeFile ?? "";
+                    } while (Process32Next(h, ref pe));
+                }
+            }
+            finally { CloseHandle(h); }
+            return s;
+        }
+
+        // 目标以 exe 完整路径给出；按文件名匹配运行中的根进程（路径可读时再按全路径确认）。
+        static bool IsRoot(Process p, HashSet<string> targetNames, HashSet<string> targetPaths)
+        {
+            try
+            {
+                string nm = p.ProcessName + ".exe";
+                if (!targetNames.Contains(nm.ToLowerInvariant())) return false;
+                // 文件名匹配即算命中；若能读到全路径且用户给的是全路径，则要求全路径一致。
+                try
+                {
+                    string full = p.MainModule != null ? p.MainModule.FileName : null;
+                    if (full != null && targetPaths.Count > 0)
+                        return targetPaths.Contains(full.ToLowerInvariant());
+                }
+                catch { /* 读不到路径（权限/位数差异）就只按文件名算命中 */ }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // 返回被关闭的进程数。
+        public static int KillTargets(IEnumerable<string> paths, bool forceImmediate)
+        {
+            HashSet<string> names = new HashSet<string>();
+            HashSet<string> fulls = new HashSet<string>();
+            foreach (string p in paths)
+            {
+                if (string.IsNullOrEmpty(p)) continue;
+                try { names.Add(Path.GetFileName(p).ToLowerInvariant()); } catch { }
+                fulls.Add(p.ToLowerInvariant());
+            }
+            if (names.Count == 0) return 0;
+
+            Snap snap = Enumerate();
+
+            // 找根：运行中、exe 名（或全路径）匹配的进程。
+            List<int> roots = new List<int>();
+            foreach (Process p in Process.GetProcesses())
+            {
+                if (IsRoot(p, names, fulls)) roots.Add(p.Id);
+                p.Dispose();
+            }
+            if (roots.Count == 0) return 0;
+
+            // 由父子关系收集所有后代，连同根组成待关闭集合。
+            HashSet<int> set = new HashSet<int>(roots);
+            bool grew = true;
+            while (grew)
+            {
+                grew = false;
+                foreach (KeyValuePair<int, int> kv in snap.parent)
+                {
+                    if (!set.Contains(kv.Key) && set.Contains(kv.Value) && kv.Key != 0)
+                    {
+                        set.Add(kv.Key); grew = true;
+                    }
+                }
+            }
+
+            int ownPid = 0;
+            try { ownPid = Process.GetCurrentProcess().Id; } catch { }
+            set.Remove(ownPid);   // 绝不关自己
+
+            // 取得 Process 句柄
+            List<Process> procs = new List<Process>();
+            foreach (int pid in set)
+            {
+                try { procs.Add(Process.GetProcessById(pid)); } catch { }
+            }
+            if (procs.Count == 0) return 0;
+
+            if (!forceImmediate)
+            {
+                // 先对有主窗口的发正常关闭
+                foreach (Process p in procs)
+                {
+                    try { if (p.MainWindowHandle != IntPtr.Zero) p.CloseMainWindow(); } catch { }
+                }
+                // 等最多 2 秒
+                DateTime until = DateTime.Now.AddMilliseconds(2000);
+                while (DateTime.Now < until)
+                {
+                    bool anyAlive = false;
+                    foreach (Process p in procs) { try { if (!p.HasExited) { anyAlive = true; break; } } catch { } }
+                    if (!anyAlive) break;
+                    Thread.Sleep(150);
+                }
+            }
+
+            // 强制结束残留：按"子在前、父在后"排序（后代 PID 一般更大，逆序近似）
+            procs.Sort(delegate(Process a, Process b)
+            {
+                int ia = 0, ib = 0; try { ia = a.Id; } catch { } try { ib = b.Id; } catch { }
+                return ib.CompareTo(ia);
+            });
+            int killed = 0;
+            foreach (Process p in procs)
+            {
+                try
+                {
+                    if (!p.HasExited) { p.Kill(); killed++; }
+                    else killed++;   // 正常关闭已退出的也算
+                }
+                catch { /* 已退出 / 拒绝访问（目标以管理员运行） */ }
+                finally { try { p.Dispose(); } catch { } }
+            }
+            return killed;
         }
     }
 
@@ -364,6 +556,10 @@ namespace IpRegionGuard
         public bool DiagLog { get; set; }                 // 详细日志：每次检测都记一行；默认 false
         public int LogRetentionDays { get; set; }         // 日志保留天数（超过自动清理）；0=不按天清
         public int LogMaxKB { get; set; }                 // 日志文件大小上限（KB）；0=不限
+        public bool KillApps { get; set; }                // 异常区域时是否关闭指定程序
+        public bool KillForce { get; set; }               // true=立即强制结束；false=先正常关再强制
+        public List<string> KillTargets { get; set; }     // 要关闭的程序 exe 完整路径列表
+        public bool StrictPreKill { get; set; }           // 严格模式：网络一变先关软件再查（默认关）
 
         public AppConfig()
         {
@@ -378,12 +574,17 @@ namespace IpRegionGuard
             DiagLog = false;
             LogRetentionDays = 14;
             LogMaxKB = 256;
+            KillApps = false;
+            KillForce = false;
+            KillTargets = new List<string>();
+            StrictPreKill = false;
         }
 
         public void Clamp()
         {
             if (Forbidden == null) Forbidden = new List<RegionRule>();
             if (Allowed == null) Allowed = new List<RegionRule>();
+            if (KillTargets == null) KillTargets = new List<string>();
             if (!string.Equals(Lang, "zh", StringComparison.OrdinalIgnoreCase)) Lang = "en";
             if (LogRetentionDays < 0) LogRetentionDays = 0;
             if (LogRetentionDays > 3650) LogRetentionDays = 3650;
@@ -773,6 +974,12 @@ namespace IpRegionGuard
         readonly NotifyIcon tray = new NotifyIcon();
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer blinkTimer = new System.Windows.Forms.Timer();
+        readonly System.Windows.Forms.Timer netDebounce = new System.Windows.Forms.Timer();  // 网络变化防抖
+        readonly System.Windows.Forms.Timer probeTimer = new System.Windows.Forms.Timer();   // 本机出口探测
+        readonly System.Windows.Forms.Timer retryTimer = new System.Windows.Forms.Timer();   // 事件后快速重试
+        string lastEgressSrc = "";       // 上次本机出口源 IP（用于探测变化）
+        int fastRetriesLeft;             // 事件触发后，离线时的快速重试次数
+        bool eventTriggeredCheck;        // 本轮检查是否由事件触发（供离线快速重试判定）
         static readonly Color colGreen = Color.FromArgb(46, 160, 67);
         static readonly Color colRed = Color.FromArgb(218, 54, 51);
         static readonly Color colYellow = Color.FromArgb(219, 171, 10);
@@ -855,8 +1062,101 @@ namespace IpRegionGuard
             timer.Tick += delegate { RunCheck(false); };
             timer.Start();
 
+            // 网络变化即触发检测：切 VPN / 网卡 / 地址变动会触发，防抖 1.5 秒后查一次
+            // （合并连续抖动、让新出口稳定）。平时仍按原间隔低频轮询，不额外刷请求。
+            netDebounce.Interval = 1500;
+            netDebounce.Tick += delegate
+            {
+                netDebounce.Stop();
+                if (!paused)
+                {
+                    lastSig = "";            // 触发源变化后允许立即重新报警
+                    fastRetriesLeft = 3;     // 事件后若离线，快速重试几次
+                    eventTriggeredCheck = true;
+                    Util.Log(pendingKickWhy + "，触发检测");
+                    RunCheck(false);
+                }
+            };
+
+            // C：事件后快速重试（网络还没就绪导致离线时，退避重查，不等下一个轮询）
+            retryTimer.Interval = 3000;
+            retryTimer.Tick += delegate
+            {
+                retryTimer.Stop();
+                if (!paused && fastRetriesLeft > 0) { eventTriggeredCheck = true; RunCheck(false); }
+            };
+
+            // B′：本机出口探测——每 4 秒本地算一次“访问公网会用哪个源 IP”（不发包、不碰限流），
+            // 变了就触发完整检测。抓双网卡路由切换、以及不少 VPN 静默失效（本地源 IP 会变）。
+            lastEgressSrc = EgressSourceIp();
+            probeTimer.Interval = 4000;
+            probeTimer.Tick += delegate
+            {
+                if (paused) return;
+                string cur = EgressSourceIp();
+                if (cur != lastEgressSrc)
+                {
+                    string prev = lastEgressSrc;
+                    lastEgressSrc = cur;
+                    KickCheck("出口变化(" + (prev.Length == 0 ? "无" : prev) + "→" + (cur.Length == 0 ? "无" : cur) + ")");
+                }
+            };
+            probeTimer.Start();
+
+            try { NetworkChange.NetworkAddressChanged += OnNetAddrChanged; } catch { }
+            try { NetworkChange.NetworkAvailabilityChanged += OnNetAvailChanged; } catch { }
+            try { Microsoft.Win32.SystemEvents.PowerModeChanged += OnPowerModeChanged; } catch { }
+            try { Microsoft.Win32.SystemEvents.SessionSwitch += OnSessionSwitch; } catch { }
+
             Util.Log("程序启动，检测间隔 " + cfg.IntervalSeconds + " 秒");
             RunCheck(false);   // 启动即检测一次
+        }
+
+        // 访问公网时本机会选用的源 IP（UDP connect 只查路由表、不发任何数据包）。
+        static string EgressSourceIp()
+        {
+            try
+            {
+                using (Socket s = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                {
+                    s.Connect("8.8.8.8", 65530);
+                    IPEndPoint ep = s.LocalEndPoint as IPEndPoint;
+                    return ep != null ? ep.Address.ToString() : "";
+                }
+            }
+            catch { return ""; }   // 完全离线等情况
+        }
+
+        // 网络变化 / 唤醒等事件（可能在任意线程触发）→ 封送到 UI 线程重启防抖计时器。
+        // 唤醒后网卡会陆续恢复、不断刷新防抖，等网络稳定后只查一次。
+        // 严格模式：事件一来先关软件（最早时点），再进入防抖去查。
+        void KickCheck(string why)
+        {
+            try
+            {
+                sync.BeginInvoke((MethodInvoker)delegate
+                {
+                    pendingKickWhy = why;
+                    if (cfg.StrictPreKill) EnforceKill();   // 严格模式：先关，后查
+                    netDebounce.Stop(); netDebounce.Start();
+                });
+            }
+            catch { }
+        }
+
+        string pendingKickWhy = "网络变化";
+        void OnNetAddrChanged(object sender, EventArgs e) { KickCheck("网络变化"); }
+        void OnNetAvailChanged(object sender, NetworkAvailabilityEventArgs e) { KickCheck(e.IsAvailable ? "网络恢复" : "网络断开"); }
+        void OnPowerModeChanged(object sender, Microsoft.Win32.PowerModeChangedEventArgs e)
+        {
+            if (e.Mode == Microsoft.Win32.PowerModes.Resume) KickCheck("睡眠唤醒");
+        }
+        void OnSessionSwitch(object sender, Microsoft.Win32.SessionSwitchEventArgs e)
+        {
+            if (e.Reason == Microsoft.Win32.SessionSwitchReason.SessionUnlock
+                || e.Reason == Microsoft.Win32.SessionSwitchReason.RemoteConnect
+                || e.Reason == Microsoft.Win32.SessionSwitchReason.RemoteDisconnect)
+                KickCheck("会话切换");
         }
 
         void RelocalizeMenu()
@@ -925,13 +1225,20 @@ namespace IpRegionGuard
                 lastError = err;
                 last = null;
                 StopBlink();
-                // 检测失败通常意味着网络不通：灰点 + 灰环（信号 0）。
+                // 检测失败通常意味着网络不通：灰点 + 灰环（信号 0）。断网不算 abnormal，不关软件。
                 curStatus = paused ? colYellow : colGray;
                 curOffline = true;
                 ApplyIcon(true);
                 SetTip(I18n.T("检测失败：", "Check failed: ") + err);
                 miStatus.Text = I18n.T("检测失败（", "Check failed (") + DateTime.Now.ToString("HH:mm:ss") + "）";
                 Util.Log("检测失败: " + err);
+                // C：事件触发后若因网络未就绪而离线，快速退避重试，不等下一个轮询。
+                if (eventTriggeredCheck && fastRetriesLeft > 0 && !paused)
+                {
+                    fastRetriesLeft--;
+                    retryTimer.Stop(); retryTimer.Start();
+                }
+                else eventTriggeredCheck = false;
                 if (manual) MessageBox.Show(I18n.T("获取位置失败：\r\n", "Failed to get location:\r\n") + err, "IPGuard",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
@@ -940,6 +1247,9 @@ namespace IpRegionGuard
             lastError = "";
             last = loc;
             curOffline = false;
+            fastRetriesLeft = 0;            // 已拿到结果，停止快速重试
+            eventTriggeredCheck = false;
+            lastEgressSrc = EgressSourceIp();   // 对齐探测基线，避免这次变化又被探测重复触发
             List<string> violations = Evaluate(loc);
             string disp = loc.Display();
 
@@ -977,6 +1287,10 @@ namespace IpRegionGuard
             if (changed) Util.Log("区域异常：" + sig + "  (IP " + loc.Ip + ")");
             lastSig = sig;
             curStatus = colRed;
+
+            // 处于异常区域：关闭指定程序（含其插件/子进程）。独立于免打扰，每次检测都执行一遍
+            // （重开的下次也会被关）。放后台线程做，避免正常关闭的 2 秒等待卡住界面。
+            EnforceKill();
 
             // 免打扰期间：图标只变红、不闪烁、不弹窗/不出声。菜单里显示剩余时间。
             if (InDnd())
@@ -1019,6 +1333,23 @@ namespace IpRegionGuard
         {
             Util.LogRetentionDays = cfg.LogRetentionDays;
             Util.LogMaxBytes = cfg.LogMaxKB * 1024;
+        }
+
+        int killBusy;   // 0/1，避免同一轮重入
+        void EnforceKill()
+        {
+            if (!cfg.KillApps || cfg.KillTargets == null || cfg.KillTargets.Count == 0) return;
+            if (Interlocked.CompareExchange(ref killBusy, 1, 0) != 0) return;
+            List<string> targets = new List<string>(cfg.KillTargets);
+            bool force = cfg.KillForce;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                int n = 0;
+                try { n = ProcKiller.KillTargets(targets, force); }
+                catch (Exception ex) { Util.Log("关闭程序出错: " + ex.Message); }
+                if (n > 0) Util.Log("已关闭程序进程 " + n + " 个（含子进程）");
+                Interlocked.Exchange(ref killBusy, 0);
+            });
         }
 
         void StartBlink()
@@ -1260,6 +1591,13 @@ namespace IpRegionGuard
         void ExitApp()
         {
             Util.Log("程序退出");
+            try { NetworkChange.NetworkAddressChanged -= OnNetAddrChanged; } catch { }
+            try { NetworkChange.NetworkAvailabilityChanged -= OnNetAvailChanged; } catch { }
+            try { Microsoft.Win32.SystemEvents.PowerModeChanged -= OnPowerModeChanged; } catch { }
+            try { Microsoft.Win32.SystemEvents.SessionSwitch -= OnSessionSwitch; } catch { }
+            netDebounce.Stop();
+            probeTimer.Stop();
+            retryTimer.Stop();
             timer.Stop();
             blinkTimer.Stop();
             tray.Visible = false;
@@ -1496,6 +1834,13 @@ namespace IpRegionGuard
                                         "Alerts on every abnormal check"),
                                   I18n.En ? 542 : 512, 64));
 
+            // 异常时关闭程序（打开独立管理对话框，直接编辑本克隆配置）
+            Button btnKill = new Button();
+            btnKill.Text = I18n.T("异常时关闭程序…", "Kill apps when abnormal…");
+            btnKill.Bounds = new Rectangle(12, 602, 220, 30);
+            btnKill.Click += delegate { using (KillAppsDialog d = new KillAppsDialog(cfg)) d.ShowDialog(this); };
+            Controls.Add(btnKill);
+
             // --- 确定 / 取消 ---
             Button ok = new Button();
             ok.Text = I18n.T("确定", "OK");
@@ -1514,7 +1859,7 @@ namespace IpRegionGuard
             Label langNote = new Label();
             langNote.Text = I18n.T("切换语言后点“确定”生效", "Language applies after you click OK");
             langNote.ForeColor = Color.DimGray;
-            langNote.Bounds = new Rectangle(12, 612, 400, 20);
+            langNote.Bounds = new Rectangle(244, 612, 320, 20);
             Controls.Add(langNote);
         }
 
@@ -1873,6 +2218,209 @@ namespace IpRegionGuard
                 }
             }
             return 0;
+        }
+    }
+
+    // ================================================================ 关闭程序：管理对话框
+
+    class KillAppsDialog : Form
+    {
+        readonly AppConfig cfg;   // 传入的（克隆）配置；仅在本对话框 OK 时写回
+        readonly List<string> work;   // 目标列表的工作副本
+        CheckBox chkEnable, chkForce, chkStrict;
+        ListBox lst;
+
+        public KillAppsDialog(AppConfig c)
+        {
+            cfg = c;
+            work = new List<string>(c.KillTargets);
+            Text = I18n.T("异常时关闭程序", "Kill apps when abnormal");
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(560, 448);
+            Font = new Font("Microsoft YaHei UI", 9f);
+
+            chkEnable = new CheckBox();
+            chkEnable.Text = I18n.T("启用：处于禁止/非允许区域时，关闭下列程序（含其插件/子进程）",
+                                    "Enable: when in a forbidden / non-allowed region, kill the apps below (incl. their plugins/child processes)");
+            chkEnable.Bounds = new Rectangle(14, 10, 540, 24);
+            chkEnable.Checked = cfg.KillApps;
+            Controls.Add(chkEnable);
+
+            chkForce = new CheckBox();
+            chkForce.Text = I18n.T("立即强制结束（不勾则先尝试正常关闭、2 秒后再强制）",
+                                   "Force-kill immediately (unchecked: try graceful close first, then force after 2s)");
+            chkForce.Bounds = new Rectangle(14, 34, 540, 24);
+            chkForce.Checked = cfg.KillForce;
+            Controls.Add(chkForce);
+
+            chkStrict = new CheckBox();
+            chkStrict.Text = I18n.T("严格模式：网络一变就先关这些程序，再去查 IP（最早动手，但切到正常网络也会先关）",
+                                    "Strict: kill on ANY network change first, then check IP (earliest, but also kills when switching to a good network)");
+            chkStrict.Bounds = new Rectangle(14, 58, 540, 24);
+            chkStrict.Checked = cfg.StrictPreKill;
+            Controls.Add(chkStrict);
+
+            lst = new ListBox();
+            lst.Bounds = new Rectangle(14, 90, 532, 268);
+            lst.HorizontalScrollbar = true;
+            Controls.Add(lst);
+            Rebind();
+
+            Button bAddRun = new Button();
+            bAddRun.Text = I18n.T("从运行列表添加…", "Add from running…");
+            bAddRun.Bounds = new Rectangle(14, 366, 150, 28);
+            bAddRun.Click += delegate { AddFromRunning(); };
+            Controls.Add(bAddRun);
+
+            Button bBrowse = new Button();
+            bBrowse.Text = I18n.T("浏览 .exe…", "Browse .exe…");
+            bBrowse.Bounds = new Rectangle(172, 366, 120, 28);
+            bBrowse.Click += delegate { Browse(); };
+            Controls.Add(bBrowse);
+
+            Button bDel = new Button();
+            bDel.Text = I18n.T("删除选中", "Remove");
+            bDel.Bounds = new Rectangle(300, 366, 100, 28);
+            bDel.Click += delegate { int i = lst.SelectedIndex; if (i >= 0 && i < work.Count) { work.RemoveAt(i); Rebind(); } };
+            Controls.Add(bDel);
+
+            Button bOk = new Button();
+            bOk.Text = I18n.T("确定", "OK");
+            bOk.Bounds = new Rectangle(352, 410, 92, 28);
+            bOk.Click += delegate
+            {
+                cfg.KillApps = chkEnable.Checked;
+                cfg.KillForce = chkForce.Checked;
+                cfg.StrictPreKill = chkStrict.Checked;
+                cfg.KillTargets = new List<string>(work);
+                DialogResult = DialogResult.OK; Close();
+            };
+            Controls.Add(bOk); AcceptButton = bOk;
+
+            Button bCancel = new Button();
+            bCancel.Text = I18n.T("取消", "Cancel");
+            bCancel.Bounds = new Rectangle(454, 410, 92, 28);
+            bCancel.DialogResult = DialogResult.Cancel;
+            Controls.Add(bCancel); CancelButton = bCancel;
+        }
+
+        void Rebind()
+        {
+            lst.BeginUpdate(); lst.Items.Clear();
+            foreach (string p in work)
+            {
+                string name; try { name = Path.GetFileName(p); } catch { name = p; }
+                string friendly = Util.FriendlyName(p, Path.GetFileNameWithoutExtension(p));
+                lst.Items.Add(friendly + "  (" + name + ")   —   " + p);
+            }
+            lst.EndUpdate();
+        }
+
+        void Add(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            foreach (string e in work)
+                if (string.Equals(e, path, StringComparison.OrdinalIgnoreCase)) return;   // 去重
+            work.Add(path);
+            Rebind();
+        }
+
+        void AddFromRunning()
+        {
+            using (RunningPicker rp = new RunningPicker())
+            {
+                if (rp.ShowDialog(this) == DialogResult.OK)
+                    foreach (string p in rp.Selected) Add(p);
+            }
+        }
+
+        void Browse()
+        {
+            using (OpenFileDialog ofd = new OpenFileDialog())
+            {
+                ofd.Filter = "Programs (*.exe)|*.exe|All files (*.*)|*.*";
+                ofd.CheckFileExists = true;
+                if (ofd.ShowDialog(this) == DialogResult.OK) Add(ofd.FileName);
+            }
+        }
+    }
+
+    // 运行中程序选择器：列出有窗口标题的用户程序，多选，返回 exe 路径（取不到则用进程名.exe）。
+    class RunningPicker : Form
+    {
+        CheckedListBox clb;
+        readonly List<string> paths = new List<string>();
+        public List<string> Selected = new List<string>();
+
+        public RunningPicker()
+        {
+            Text = I18n.T("选择要关闭的程序", "Pick apps to kill");
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(520, 420);
+            Font = new Font("Microsoft YaHei UI", 9f);
+
+            Label l = new Label();
+            l.Text = I18n.T("勾选要在异常区域时关闭的程序（只列出有窗口的）：",
+                            "Tick the apps to kill when in a bad region (windowed apps only):");
+            l.Bounds = new Rectangle(12, 10, 500, 20);
+            Controls.Add(l);
+
+            clb = new CheckedListBox();
+            clb.Bounds = new Rectangle(12, 34, 496, 336);
+            clb.CheckOnClick = true;
+            clb.HorizontalScrollbar = true;
+            Controls.Add(clb);
+            Populate();
+
+            Button bOk = new Button();
+            bOk.Text = I18n.T("添加选中", "Add selected");
+            bOk.Bounds = new Rectangle(312, 382, 96, 28);
+            bOk.Click += delegate
+            {
+                foreach (int i in clb.CheckedIndices) if (i >= 0 && i < paths.Count) Selected.Add(paths[i]);
+                DialogResult = DialogResult.OK; Close();
+            };
+            Controls.Add(bOk); AcceptButton = bOk;
+
+            Button bCancel = new Button();
+            bCancel.Text = I18n.T("取消", "Cancel");
+            bCancel.Bounds = new Rectangle(412, 382, 96, 28);
+            bCancel.DialogResult = DialogResult.Cancel;
+            Controls.Add(bCancel); CancelButton = bCancel;
+        }
+
+        void Populate()
+        {
+            // 按 exe 路径去重：一个程序一行。label 用任务管理器那样的“友好名 (进程名.exe)”。
+            Dictionary<string, string[]> byKey = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            int ownPid = 0; try { ownPid = Process.GetCurrentProcess().Id; } catch { }
+            foreach (Process p in Process.GetProcesses())
+            {
+                try
+                {
+                    if (p.Id == ownPid) continue;
+                    if (string.IsNullOrEmpty(p.MainWindowTitle)) continue;   // 只列有窗口的用户程序
+                    string procName = p.ProcessName;
+                    string path;
+                    try { path = p.MainModule != null ? p.MainModule.FileName : procName + ".exe"; }
+                    catch { path = procName + ".exe"; }     // 读不到全路径就用进程名
+                    string key = path.ToLowerInvariant();
+                    if (byKey.ContainsKey(key)) continue;
+                    string label = Util.FriendlyName(path, procName) + "  (" + Path.GetFileName(path) + ")";
+                    byKey[key] = new string[] { label, path };
+                }
+                catch { }
+                finally { try { p.Dispose(); } catch { } }
+            }
+            List<string[]> rows = new List<string[]>(byKey.Values);
+            rows.Sort(delegate(string[] a, string[] b) { return string.Compare(a[0], b[0], StringComparison.OrdinalIgnoreCase); });
+            clb.BeginUpdate();
+            foreach (string[] r in rows) { paths.Add(r[1]); clb.Items.Add(r[0]); }
+            clb.EndUpdate();
         }
     }
 
